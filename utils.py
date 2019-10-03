@@ -2,11 +2,41 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import torchvision
+import torchvision.transforms as transforms
 import numpy as np
 import pprint
 from collections import OrderedDict
 import copy
+import glob
+from PIL import Image
 
+"""
+directory
+---------
+classes
+
+AverageMeter: Computes and stores the average and current value
+My_criterion
+My_criterion_Em
+My_dataset: Customized dataset used in torch class Dataset
+My_dataset_v2: the 2nd version of My_dataset
+
+
+functions
+
+mixup_data
+mixup_criterion
+check_params: Check parameters in models (support one or two models simultaneously)
+check_model: Check if the demension of all modules is matching
+check_grad: Check gradient of model parameters (support one or two models simultaneously)
+check_learning_rate: Check learning rate in modules
+analyze_output: Obtain some indicators in softmax output of correct label in a batch
+drop_msecond: Drop the m second string in the datetime string
+time_delta2str: Transform datetime.timedelta variable to needed string
+default_loader: Default data loader used in torch class DataLoader
+save_checkpoint: Save the current model
+
+"""
 
 class AverageMeter():
     """
@@ -212,29 +242,38 @@ def check_model(input_size, model):
 def check_grad(model1, model2=''):
     """
     Single model version (model2 has passed nothing):
-        Check parameters in models, especially used in weight-share model to verify that
+        Check gradient of model parameters, especially used in weight-share model to verify that
         the weight is shared correctly.
         Shared weight have the same summation, while independent one are not the same.
     Double model version:
-        Check parameters in two weight-share models, to verify that the weight is shared correctly.
+        Check gradient in two weight-share models, to verify that the weight is shared correctly.
         Shared weight have the same summation, while independent one are not the same.
     """    
     minimum = 10086
     maximum = 0
     simple_sum = 0
     simple_count = 0
+
     if model2 == '':
-        for name, param in model1.named_parameters():
-#             print(name, param.grad.abs().sum())
-#             print(name, param.grad.abs().mean())
-            if param.grad.abs().mean() < minimum:
-                minimum = param.grad.abs().mean()
-            elif param.grad.abs().mean() > maximum:
-                maximum = param.grad.abs().mean()
-            simple_sum += param.grad.abs().mean()
-            simple_count += 1
-        simple_mean = simple_sum / simple_count
-#         print('min:', minimum, 'max:', maximum, 'mean:', simple_mean)
+        try:
+            if 'Tensor' in str(model1.__class__).split("'")[1]: # for the condition that model1 is not a module, but an image (in adversial-sample-like training)
+                print('min:', model1.grad.abs().min(), 'max:', model1.grad.abs().max(), 'mean:', model1.grad.abs().mean())
+                return model1.grad.abs().mean()   
+                
+            for name, param in model1.named_parameters():
+    #             print(name, param.grad.abs().sum())
+    #             print(name, param.grad.abs().mean())
+                if param.grad.abs().mean() < minimum:
+                    minimum = param.grad.abs().mean()
+                elif param.grad.abs().mean() > maximum:
+                    maximum = param.grad.abs().mean()
+                simple_sum += param.grad.abs().mean()
+                simple_count += 1
+            simple_mean = simple_sum / simple_count
+            print('min:', minimum, 'max:', maximum, 'mean:', simple_mean)
+        except AttributeError as e:
+            raise AttributeError("{}. Maybe the parameter '{}' in model is not used, please have a check.".format(e, name))
+            
         return simple_mean
 
     # simple implementation, hard to make comparation if the model is a bit complex
@@ -262,7 +301,10 @@ def check_grad(model1, model2=''):
             # print('stop2')
             m2_next = False         
 
-            
+def check_learning_rate(optimizer):
+    for param_group in optimizer.param_groups:
+        print('{} has a learning rate of {}'.format(param_group['name'], param_group['lr']))
+
 def analyze_output(outputs, labels='', need_softmax=False, others=''):
     """
     Obtain the mininum, maximum and medium number in softmax output of correct label in a batch
@@ -328,3 +370,81 @@ def time_delta2str(time_delta):
     # str(time_delta) is like "0:12:47.125697"
     h, m, s = str(time_delta).split('.')[0].split(':')
     return '{}h{}m{}s'.format(h, m, s)
+
+def default_loader(path):
+#     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)        
+#     with open(path, 'rb') as f:
+#         img = Image.open(f)
+#         img_PIL = img.convert('RGB')
+    img_PIL = Image.open(path)
+    # 到时记得transform是要做标准化的，可能要补上一些语句
+#     transform = transforms.Compose([
+#         transforms.ToTensor(),
+# #         normalize
+#     ])  
+    # 到时记得transform是要做标准化的，可能要补上一些语句
+    transform = transforms.Compose([
+        transforms.Resize(320),
+        transforms.RandomCrop((299,299)),
+        transforms.ToTensor(),
+#         normalize
+    ])      
+    img_tensor = transform(img_PIL)
+    if img_tensor.size(0) == 1: # expand the grayscale image to RGB image
+        img_tensor = img_tensor.repeat(3, 1, 1)
+
+    return img_tensor
+    
+class My_dataset(torch.utils.data.Dataset):
+    #     def __init__(self, img_paths, label_paths, loader=default_loader_valid):
+    #     def __init__(self, s_filename, loader=default_loader_valid):
+        def __init__(self, source_filename, target_filename):
+    #         self.loader = loader
+            self.source = np.load(source_filename)
+            self.target = np.load(target_filename)
+
+        def __getitem__(self, index):
+            src = self.source[index, :].copy()
+            tgt = self.target[index, :].copy()
+            return src, tgt
+
+        def __len__(self):
+    #         return len(self.img_paths)
+            return self.source.shape[0]
+    
+class My_dataset_v2(torch.utils.data.Dataset):
+    def __init__(self, source_folder, target_folder, fmt='jpg', loader=default_loader):
+        self.loader = loader
+        self.images_path_src = glob.glob(source_folder + '/*.' + fmt)
+        self.images_path_tgt = glob.glob(target_folder + '/*.' + fmt)
+
+    def __getitem__(self, index):
+        src = self.loader(self.images_path_src[index])
+        tgt = self.loader(self.images_path_tgt[index])
+        return src, tgt
+
+    def __len__(self):
+        return len(self.images_path_src)
+    
+def save_checkpoint(states, is_best, args, epoch):
+# def save_checkpoint(states, args, epoch):
+    """
+    Save the current model in the end of every epoch, and maintain the best model in training procedure
+    Parameters
+    ----------
+    states: dict
+    is_best: bool
+        Indicator of whether the current model is the best one, True for yes
+    args: Namespace
+        Arguments that main.py receive
+    epoch: int
+        The current epoch
+    Returns
+    -------
+    This function has no return
+    """
+    filename = '_'.join([args.source_domain[0]+'2'+args.target_domain[0], str(epoch), 'checkpoint.pth.tar'])
+    dir_save_file = os.path.join(args.log, filename)
+    torch.save(states, dir_save_file)
+    if is_best:
+        shutil.copyfile(dir_save_file, os.path.join(args.log, 'model_best.pth.tar'))    
