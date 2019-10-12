@@ -7,8 +7,9 @@ import numpy as np
 import pprint
 from collections import OrderedDict
 import copy
-import glob
-from PIL import Image
+import math
+import os
+import shutil
 
 """
 directory
@@ -18,9 +19,7 @@ classes
 AverageMeter: Computes and stores the average and current value
 My_criterion
 My_criterion_Em
-My_dataset: Customized dataset used in torch class Dataset
-My_dataset_v2: the 2nd version of My_dataset
-
+MMD_Loss: Mean maximum discrepancy loss
 
 functions
 
@@ -33,8 +32,8 @@ check_learning_rate: Check learning rate in modules
 analyze_output: Obtain some indicators in softmax output of correct label in a batch
 drop_msecond: Drop the m second string in the datetime string
 time_delta2str: Transform datetime.timedelta variable to needed string
-default_loader: Default data loader used in torch class DataLoader
 save_checkpoint: Save the current model
+numpy_to_python: Change format of elements in a dict
 
 """
 
@@ -371,61 +370,8 @@ def time_delta2str(time_delta):
     h, m, s = str(time_delta).split('.')[0].split(':')
     return '{}h{}m{}s'.format(h, m, s)
 
-def default_loader(path):
-#     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)        
-#     with open(path, 'rb') as f:
-#         img = Image.open(f)
-#         img_PIL = img.convert('RGB')
-    img_PIL = Image.open(path)
-    # 到时记得transform是要做标准化的，可能要补上一些语句
-#     transform = transforms.Compose([
-#         transforms.ToTensor(),
-# #         normalize
-#     ])  
-    # 到时记得transform是要做标准化的，可能要补上一些语句
-    transform = transforms.Compose([
-        transforms.Resize(320),
-        transforms.RandomCrop((299,299)),
-        transforms.ToTensor(),
-#         normalize
-    ])      
-    img_tensor = transform(img_PIL)
-    if img_tensor.size(0) == 1: # expand the grayscale image to RGB image
-        img_tensor = img_tensor.repeat(3, 1, 1)
 
-    return img_tensor
-    
-class My_dataset(torch.utils.data.Dataset):
-    #     def __init__(self, img_paths, label_paths, loader=default_loader_valid):
-    #     def __init__(self, s_filename, loader=default_loader_valid):
-        def __init__(self, source_filename, target_filename):
-    #         self.loader = loader
-            self.source = np.load(source_filename)
-            self.target = np.load(target_filename)
 
-        def __getitem__(self, index):
-            src = self.source[index, :].copy()
-            tgt = self.target[index, :].copy()
-            return src, tgt
-
-        def __len__(self):
-    #         return len(self.img_paths)
-            return self.source.shape[0]
-    
-class My_dataset_v2(torch.utils.data.Dataset):
-    def __init__(self, source_folder, target_folder, fmt='jpg', loader=default_loader):
-        self.loader = loader
-        self.images_path_src = glob.glob(source_folder + '/*.' + fmt)
-        self.images_path_tgt = glob.glob(target_folder + '/*.' + fmt)
-
-    def __getitem__(self, index):
-        src = self.loader(self.images_path_src[index])
-        tgt = self.loader(self.images_path_tgt[index])
-        return src, tgt
-
-    def __len__(self):
-        return len(self.images_path_src)
-    
 def save_checkpoint(states, is_best, args, epoch):
 # def save_checkpoint(states, args, epoch):
     """
@@ -445,6 +391,98 @@ def save_checkpoint(states, is_best, args, epoch):
     """
     filename = '_'.join([args.source_domain[0]+'2'+args.target_domain[0], str(epoch), 'checkpoint.pth.tar'])
     dir_save_file = os.path.join(args.log, filename)
+    print(dir_save_file)
     torch.save(states, dir_save_file)
     if is_best:
         shutil.copyfile(dir_save_file, os.path.join(args.log, 'model_best.pth.tar'))    
+        
+class MMD_Loss(nn.Module):
+    class gaussian_kernel():
+        def __init__(self, bw_list):
+            """PS: bw_list means bandwidth list, which is a list of \sigma in the gaussian kernel.
+               This class can used more than one kernel to compute the output.
+            """
+    #         super(gaussian_kernel, self).__init__()
+            self.bw_list = bw_list
+
+        def forward(self, L2_distance):
+            """PS: L2_distance is a nxn matrix"""
+            output_multi_kernels = [torch.exp(-L2_distance / (2 * (bw ** 2))) for bw in self.bw_list] # len()=len(bw_list)
+            output_sumup = sum(output_multi_kernels)
+            return output_sumup        
+        
+    def __init__(self, bw_list=[1, 3, 5, 8, 10], mode='simple'):
+        super(MMD_Loss, self).__init__()
+        # now use the auto-adaptation method to compute bw_list from input data, i.e. bw_list is data-dependent, so it is meanless to initial bw_list here
+        self.bw_list = bw_list
+        self.mode = mode
+        
+    def forward(self, source, target):#mse：最小平方误差函数
+        """
+        source: torch.FLoatTensor, with shape [batch_size, out_features]
+            features of source images for MMD
+        target: torch.FLoatTensor, with shape [batch_size, out_features]
+            features of target images for MMD            
+        G: gaussian kernel
+        """
+        batch_size, out_features = source.size()
+        expand_size = batch_size * 2
+        concat_matrix = torch.cat([source, target], dim=0) # [2*batch_size, out_features]
+        # expand the 2D matrix to 3D tensor to compute the distance matrix at one computation, rather than a double "for" cycle
+        # concat_matrix.unsqueeze(0).size = [1, 2*batch_size, out_features]
+        concat_matrix_expand_in_dim_0 = concat_matrix.unsqueeze(0).expand(expand_size, expand_size, out_features)
+        # concat_matrix.unsqueeze(1).size = [2*batch_size, 1, out_features]
+        concat_matrix_expand_in_dim_1 = concat_matrix.unsqueeze(1).expand(expand_size, expand_size, out_features)
+        # note that both in concat_matrix_expand_in_dim_0 and concat_matrix_expand_in_dim_1, mat[foo, bar, :] is a features vector
+        L2_distance = ((concat_matrix_expand_in_dim_0 - concat_matrix_expand_in_dim_1) ** 2).sum(2) # [2*batch_size, 2*batch_size] L2_distance[0,0] = dist(x1,x1), [0,1]=dist(x2,x1), [1,0]=dist(x1,x2)...
+        # computation for bw_list in Long's DAN 
+        bandwidth = torch.sum(L2_distance.data) / (expand_size ** 2 - expand_size) 
+        kernel_mul, kernel_num = 2, 5
+        bandwidth /= kernel_mul ** (kernel_num // 2)
+        bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
+        self.bw_list = [math.sqrt(i/2) for i in bandwidth_list]
+        G = self.gaussian_kernel(self.bw_list)
+        kernel_val = G.forward(L2_distance)
+        
+        if self.mode == 'complete':
+            # complete mode, O(n^2) time complexity
+            XX_dist = kernel_val[0:batch_size, 0:batch_size]
+            YY_dist = kernel_val[batch_size:, batch_size:]
+            XY_dist = kernel_val[0:batch_size, batch_size:] 
+            loss = (XX_dist.sum() - kernel_num*batch_size) / (batch_size * (batch_size - 1)) + \
+                   (YY_dist.sum() - kernel_num*batch_size) / (batch_size * (batch_size - 1)) - \
+                   XY_dist.sum() * 2 / (batch_size * batch_size)
+        elif self.mode == 'simple':
+            # simplified mode, O(n) time complexity
+            ind_s_1 = list(range(0, batch_size))
+            ind_s_2 = list(range(1, batch_size)) + [0]
+            ind_t_1 = list(range(batch_size, 2*batch_size))
+            ind_t_2 = list(range(batch_size+1, 2*batch_size)) + [batch_size]
+            loss = kernel_val[ind_s_1, ind_s_2] + kernel_val[ind_t_1, ind_t_2] \
+                  - kernel_val[ind_s_1, ind_t_2] - kernel_val[ind_s_2, ind_t_1] # [batch_size] for this computation method
+#             loss = kernel_val[ind_s_1, ind_s_2] + kernel_val[ind_t_1, ind_t_2] \
+#                   - 2 * kernel_val[ind_s_1, ind_t_1] # another computation formulation, will be similar with the above one if batch_size or D is big enough
+            loss /= batch_size
+            loss = loss.sum()        
+            #### end of simplified mode ####
+        
+        return loss          
+    
+def numpy_to_python(numpy_dict):
+    """
+    Change the format of elements in a dict from np.array to int or float.
+    Only support dict input now.
+    Parameters
+    ----------
+    numpy_dict: dict
+        Such as {'color': array([130,   9,  81]), 'angle': array([312])}
+    Returns
+    -------
+    python_dict: dict
+        Such as {'color': [130,   9,  81], 'angle': [312]}
+    """
+    python_dict = {}
+    for key in numpy_dict.keys():
+        python_dict[key] = [value.item() for value in numpy_dict[key]]
+
+    return python_dict    
