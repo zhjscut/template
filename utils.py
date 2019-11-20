@@ -10,6 +10,8 @@ import copy
 import math
 import os
 import shutil
+import time 
+import json
 
 """
 directory
@@ -20,6 +22,7 @@ AverageMeter: Computes and stores the average and current value
 My_criterion
 My_criterion_Em
 MMD_Loss: Mean maximum discrepancy loss
+Timer: Print time information in different stages
 
 functions
 
@@ -33,7 +36,7 @@ analyze_output: Obtain some indicators in softmax output of correct label in a b
 drop_msecond: Drop the m second string in the datetime string
 time_delta2str: Transform datetime.timedelta variable to needed string
 save_checkpoint: Save the current model
-numpy_to_python: Change format of elements in a dict
+save_summary: Save info about path of the best model and its performance
 
 """
 
@@ -370,8 +373,6 @@ def time_delta2str(time_delta):
     h, m, s = str(time_delta).split('.')[0].split(':')
     return '{}h{}m{}s'.format(h, m, s)
 
-
-
 def save_checkpoint(states, is_best, args, epoch):
 # def save_checkpoint(states, args, epoch):
     """
@@ -396,6 +397,43 @@ def save_checkpoint(states, is_best, args, epoch):
     if is_best:
         shutil.copyfile(dir_save_file, os.path.join(args.log, 'model_best.pth.tar'))    
         
+def save_summary(filepath, model, model_path, best, smaller=True):
+    """
+    Save a summary npy file, which contain path of the best model and its performance.
+    Parameters
+    ----------
+    filename: string
+        Path of .npy file
+    model: torch model
+        Model of a network
+    model_path: string
+        Path of model file
+    best: float
+        Best performance of the model, can be loss, accuracy or others.
+    smaller: bool (default: True)
+        The indicator of whether the performance is the smaller the better (default) or the bigger the better
+    """
+    try:
+        summary = np.load(filepath).item()
+    except: # the summary file has not been created
+        summary = {}
+
+    if model_path in summary.keys(): 
+        if smaller:
+            if best < summary[model_path]: # refresh the old model info to a better one
+                torch.save(model, model_path)
+                summary[model_path] = best
+        else:
+            if best > summary[model_path]: # refresh the old model info to a better one
+                torch.save(model, model_path)
+                summary[model_path] = best            
+            
+    else: # new model
+        summary[model_path] = best
+#     print(filepath)
+#     print(summary)
+    np.save(filepath, summary)
+    
 class MMD_Loss(nn.Module):
     class gaussian_kernel():
         def __init__(self, bw_list):
@@ -443,7 +481,6 @@ class MMD_Loss(nn.Module):
         self.bw_list = [math.sqrt(i/2) for i in bandwidth_list]
         G = self.gaussian_kernel(self.bw_list)
         kernel_val = G.forward(L2_distance)
-        
         if self.mode == 'complete':
             # complete mode, O(n^2) time complexity
             XX_dist = kernel_val[0:batch_size, 0:batch_size]
@@ -467,22 +504,25 @@ class MMD_Loss(nn.Module):
             #### end of simplified mode ####
         
         return loss          
-    
-def numpy_to_python(numpy_dict):
-    """
-    Change the format of elements in a dict from np.array to int or float.
-    Only support dict input now.
-    Parameters
-    ----------
-    numpy_dict: dict
-        Such as {'color': array([130,   9,  81]), 'angle': array([312])}
-    Returns
-    -------
-    python_dict: dict
-        Such as {'color': [130,   9,  81], 'angle': [312]}
-    """
-    python_dict = {}
-    for key in numpy_dict.keys():
-        python_dict[key] = [value.item() for value in numpy_dict[key]]
 
-    return python_dict    
+class Timer():
+    def __init__(self):
+        pass
+
+    def start(self):
+        self.begin = time.time()
+        self.end = time.time()
+
+    def set_point(self):
+        """set_point is equal to show_interval_time without output info."""
+        self.end = time.time()
+
+    def show_total_time(self, string='total'):
+        print( 'total - {}: {:.3f}s'.format(string, time.time() - self.begin ) )
+
+    def show_interval_time(self, string='interval'):
+        print( 'inverval - {}: {:.3f}s'.format(string, time.time() - self.end ) )
+        self.end = time.time()
+
+
+
